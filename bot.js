@@ -2,13 +2,15 @@ const { Client, GatewayIntentBits, PermissionsBitField, ChannelType, EmbedBuilde
 const fs = require('fs');
 const path = require('path');
 
-const BOT_TOKEN = require('./config').BOT_TOKEN;
-const VC_LOG_CHANNEL_ID = require('./config').VC_LOG_CHANNEL_ID;
-const HUB_CHANNEL_ID = require('./config').HUB_CHANNEL_ID;
-const LOGS_DIRECTORY = require('./config').LOGS_DIRECTORY;
-const EMPTY_CHANNEL_TIMEOUT = require('./config').EMPTY_CHANNEL_TIMEOUT;
-const GUILD_ID = require('./config').GUILD_ID;
-const CLIENT_ID = require('./config').CLIENT_ID;
+require('dotenv').config(); // Load environment variables from .env file
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const VC_LOG_CHANNEL_ID = process.env.VC_LOG_CHANNEL_ID;
+const HUB_CHANNEL_ID = process.env.HUB_CHANNEL_ID;
+const LOGS_DIRECTORY = process.env.LOGS_DIRECTORY || './logs';
+const EMPTY_CHANNEL_TIMEOUT = parseInt(process.env.EMPTY_CHANNEL_TIMEOUT || '300000'); // Default 5 mins
+const GUILD_ID = process.env.GUILD_ID;
+const CLIENT_ID = process.env.CLIENT_ID;
 
 const DATA_FILE = './data.json';
 const ACTIVE_CHANNELS_FILE = './active_channels.json';
@@ -17,22 +19,16 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildVoiceStates, // REQUIRED for voiceStateUpdate
         GatewayIntentBits.GuildMembers
     ]
 });
 
-if (!fs.existsSync(LOGS_DIRECTORY)) {
-    fs.mkdirSync(LOGS_DIRECTORY);
-}
+if (!fs.existsSync(LOGS_DIRECTORY)) fs.mkdirSync(LOGS_DIRECTORY);
 
-if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ trustedUsers: {}, blacklist: [] }, null, 2));
-}
+if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ trustedUsers: {}, blacklist: [] }, null, 2));
 
-if (!fs.existsSync(ACTIVE_CHANNELS_FILE)) {
-    fs.writeFileSync(ACTIVE_CHANNELS_FILE, JSON.stringify({}, null, 2));
-}
+if (!fs.existsSync(ACTIVE_CHANNELS_FILE)) fs.writeFileSync(ACTIVE_CHANNELS_FILE, JSON.stringify({}, null, 2));
 
 function loadData() {
     const data = JSON.parse(fs.readFileSync(DATA_FILE));
@@ -87,6 +83,83 @@ async function logEvent(guild, channelId, logMessage, ownerId, channelName) {
     fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${logMessage}\n`);
 }
 
+async function updateChannelPermissions(channel, ownerId) {
+    const permissions = [
+        {
+            id: channel.guild.roles.everyone.id,
+            deny: [PermissionsBitField.Flags.Connect]
+        },
+        {
+            id: ownerId,
+            allow: [
+                PermissionsBitField.Flags.ViewChannel,
+                PermissionsBitField.Flags.Connect,
+                PermissionsBitField.Flags.ManageChannels,
+                PermissionsBitField.Flags.MoveMembers,
+                PermissionsBitField.Flags.MuteMembers
+            ]
+        }
+    ];
+
+    if (trustedUsers[ownerId]) {
+        trustedUsers[ownerId].forEach(userId => {
+            permissions.push({
+                id: userId,
+                allow: [PermissionsBitField.Flags.Connect]
+            });
+        });
+    }
+
+    await channel.permissionOverwrites.set(permissions);
+
+    // Remove users no longer trusted from the channel
+    channel.members.forEach(member => {
+        if (member.id !== ownerId && (!trustedUsers[ownerId] || !trustedUsers[ownerId].includes(member.id))) {
+            member.voice.disconnect();
+        }
+    });
+}
+
+client.on('voiceStateUpdate', async (oldState, newState) => {
+    if (newState.channelId === HUB_CHANNEL_ID) {
+        const guild = newState.guild;
+        const member = newState.member;
+        const hubChannel = guild.channels.cache.get(HUB_CHANNEL_ID);
+
+        if (!hubChannel) {
+            console.error("Hub channel not found.");
+            return;
+        }
+
+        const category = hubChannel.parent;
+        const channelName = `${member.displayName}'s Private Call`;
+
+        try {
+            const privateChannel = await guild.channels.create({
+                name: channelName,
+                type: ChannelType.GuildVoice,
+                parent: category.id,
+                permissionOverwrites: [] // Permissions will be set after channel creation
+            });
+
+            await updateChannelPermissions(privateChannel, member.id);
+
+            activeChannels.set(privateChannel.id, {
+                ownerId: member.id,
+                timeout: Date.now() + EMPTY_CHANNEL_TIMEOUT
+            });
+            saveActiveChannels(Object.fromEntries(activeChannels));
+
+            await logEvent(guild, privateChannel.id, "Channel Created", member.id, privateChannel.name);
+
+            await member.voice.setChannel(privateChannel);
+
+        } catch (error) {
+            console.error("Error creating private voice channel:", error);
+        }
+    }
+});
+
 async function checkEmptyChannels() {
     for (const [channelId, { ownerId, timeout }] of activeChannels) {
         let channel = client.channels.cache.get(channelId);
@@ -126,49 +199,10 @@ async function checkEmptyChannels() {
                 embedMessages.delete(channelId); // Remove embed tracking
             }
         } else if (channel) {
-            // Extend timeout if the channel is not empty
             activeChannels.set(channelId, { ownerId, timeout: Date.now() + EMPTY_CHANNEL_TIMEOUT });
             saveActiveChannels(Object.fromEntries(activeChannels));
         }
     }
-}
-
-async function updateChannelPermissions(channel, ownerId) {
-    const permissions = [
-        {
-            id: channel.guild.roles.everyone.id,
-            deny: [PermissionsBitField.Flags.Connect]
-        },
-        {
-            id: ownerId,
-            allow: [
-                PermissionsBitField.Flags.ViewChannel,
-                PermissionsBitField.Flags.Connect,
-                PermissionsBitField.Flags.ManageChannels,
-                PermissionsBitField.Flags.MoveMembers,
-                PermissionsBitField.Flags.MuteMembers
-            ]
-        }
-    ];
-
-    // Add permissions for trusted users
-    if (trustedUsers[ownerId]) {
-        trustedUsers[ownerId].forEach(userId => {
-            permissions.push({
-                id: userId,
-                allow: [PermissionsBitField.Flags.Connect]
-            });
-        });
-    }
-
-    await channel.permissionOverwrites.set(permissions);
-
-    // Remove users no longer trusted from the channel
-    channel.members.forEach(member => {
-        if (member.id !== ownerId && (!trustedUsers[ownerId] || !trustedUsers[ownerId].includes(member.id))) {
-            member.voice.disconnect();
-        }
-    });
 }
 
 client.once('ready', async () => {
@@ -182,7 +216,6 @@ client.once('ready', async () => {
     try {
         console.log('Started clearing old application (/) commands.');
 
-        // Clear old commands
         await rest.put(
             Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
             { body: [] }
@@ -190,7 +223,6 @@ client.once('ready', async () => {
 
         console.log('Cleared old application (/) commands.');
 
-        // Register new commands
         console.log('Started refreshing application (/) commands.');
 
         await rest.put(
@@ -203,7 +235,7 @@ client.once('ready', async () => {
                         {
                             name: 'user',
                             description: 'The user to add to your trusted list',
-                            type: 6, // USER type
+                            type: 6,
                             required: true
                         }
                     ]
@@ -215,7 +247,7 @@ client.once('ready', async () => {
                         {
                             name: 'user',
                             description: 'The user to remove from your trusted list',
-                            type: 6, // USER type
+                            type: 6,
                             required: true
                         }
                     ]
@@ -231,7 +263,7 @@ client.once('ready', async () => {
                         {
                             name: 'user',
                             description: 'The user to add to the blacklist',
-                            type: 6, // USER type
+                            type: 6,
                             required: true
                         }
                     ]
@@ -243,7 +275,7 @@ client.once('ready', async () => {
                         {
                             name: 'user',
                             description: 'The user to remove from the blacklist',
-                            type: 6, // USER type
+                            type: 6,
                             required: true
                         }
                     ]
@@ -259,7 +291,7 @@ client.once('ready', async () => {
                         {
                             name: 'status',
                             description: 'The status to set (Open, Friends, Closed)',
-                            type: 3, // STRING type
+                            type: 3,
                             required: true,
                             choices: [
                                 { name: 'Open', value: 'Open' },
@@ -295,7 +327,6 @@ client.on('interactionCreate', async (interaction) => {
             trustedUsers[ownerId].push(user.id);
             saveData(trustedUsers, blacklist);
 
-            // Update permissions for all channels owned by this user
             for (const [channelId, data] of activeChannels) {
                 if (data.ownerId === ownerId) {
                     const channel = client.channels.cache.get(channelId);
@@ -311,20 +342,18 @@ client.on('interactionCreate', async (interaction) => {
 
     if (commandName === 'removetrusted') {
         const user = options.getUser('user');
-        const ownerId = interaction.user.id; // User managing their own trusted list
+        const ownerId = interaction.user.id;
 
         if (trustedUsers[ownerId]?.includes(user.id)) {
             trustedUsers[ownerId] = trustedUsers[ownerId].filter(id => id !== user.id);
             saveData(trustedUsers, blacklist);
 
-            // Update permissions for all channels owned by this user and kick users if necessary
             for (const [channelId, data] of activeChannels) {
                 if (data.ownerId === ownerId) {
                     const channel = client.channels.cache.get(channelId);
                     if (channel) {
                         await updateChannelPermissions(channel, ownerId);
 
-                        // Kick the user if they are in the channel
                         if (channel.members.has(user.id)) {
                             const member = channel.members.get(user.id);
                             await member.voice.disconnect();
@@ -340,8 +369,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (commandName === 'viewtrusted') {
-        const ownerId = interaction.user.id; // User managing their own trusted list
-
+        const ownerId = interaction.user.id;
         const trusted = trustedUsers[ownerId]?.map(id => `<@${id}>`).join(', ') || 'None';
         return interaction.reply({ content: `Your trusted users: ${trusted}`, ephemeral: true });
     }
